@@ -1,0 +1,317 @@
+---
+title: "Generation audit: session-level retrieval"
+subtitle: "Memory-only gold sessions; does not re-estimate distribution effects"
+author: "MemMeetDoc"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    embed-resources: true
+    theme: flatly
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 120
+)
+options(width = 110)
+```
+
+This check asks whether session-generation attributes made some gold sessions
+harder to retrieve. The outcome is a **strict** evidence hit on that session.
+Persona and **per-evidence** in-domain status (this item's category vs.\ \(T_p\))
+are controls, not a second test of RQ1b. Incomplete sessions (missing key
+information in the audit) cannot receive a strict hit; they stay in the primary
+fit and are dropped in a sensitivity refit.
+
+# Setup
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(lme4)
+  library(emmeans)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(broom.mixed)
+  library(car)
+  library(knitr)
+})
+
+set.seed(42)
+emm_options(pbkrtest.limit = 1e5, lmerTest.limit = 1e5)
+glmer_ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 3e5))
+
+AGENT_LABELS <- c(
+  agent_1 = "Separate Store",
+  agent_2 = "MemPalace",
+  agent_3 = "Corrective",
+  agent_4 = "Unified Store"
+)
+PERSONA_LABELS <- c(
+  persona_1 = "Tech",
+  persona_2 = "Business-Tech",
+  persona_3 = "Sports"
+)
+theme_thesis <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title    = element_blank(),
+      plot.subtitle = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold")
+    )
+}
+
+relabel <- function(x, map) factor(unname(map[as.character(x)]), levels = unname(map))
+```
+
+```{r paths}
+find_repo_root <- function() {
+  candidates <- c(".", "..", getwd())
+  for (cand in candidates) {
+    if (file.exists(file.path(cand, "data", "analysis", "model_features_audit.csv"))) {
+      return(normalizePath(cand))
+    }
+  }
+  normalizePath(".")
+}
+REPO   <- find_repo_root()
+DATA   <- file.path(REPO, "data", "analysis")
+OUTDIR <- file.path(DATA, "rmd")
+FIGDIR <- file.path(REPO, "analysis", "figures", "audit")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGDIR, recursive = TRUE, showWarnings = FALSE)
+cat("Figure artifacts → ", FIGDIR, "\n", sep = "")
+
+AUDIT_CSV <- file.path(DATA, "model_features_audit.csv")
+stopifnot(file.exists(AUDIT_CSV))
+```
+
+```{r helpers}
+prepare_audit <- function(dat) {
+  dat$question          <- factor(dat$block_id)
+  dat$evidence_id       <- factor(dat$evidence_id)
+  dat$persona           <- factor(dat$persona)
+  dat$agent             <- factor(dat$agent)
+  dat$evidence_in_domain <- factor(
+    dat$evidence_in_domain,
+    levels = c(TRUE, FALSE),
+    labels = c("in_domain", "out_of_domain")
+  )
+  dat$evidence_placement <- factor(dat$evidence_placement)
+  dat$topic_drift        <- factor(dat$topic_drift)
+  dat$evidence_density   <- factor(dat$evidence_density)
+  dat$actual_turns       <- as.numeric(dat$actual_turns)
+  dat$retrieved_strict   <- as.integer(dat$retrieved_strict)
+  dat
+}
+
+tidy_fixef <- function(fit) {
+  broom.mixed::tidy(fit, effects = "fixed", conf.int = TRUE)
+}
+
+save_csv <- function(x, name) {
+  readr::write_csv(as.data.frame(x), file.path(OUTDIR, name))
+  invisible(x)
+}
+
+anova_type3 <- function(fit, file, caption) {
+  tab <- car::Anova(fit, type = 3)
+  tab <- tab[rownames(tab) != "(Intercept)", , drop = FALSE]
+  df <- as.data.frame(tab)
+  df$Term <- rownames(df)
+  df <- df[, c("Term", setdiff(names(df), "Term"))]
+  save_csv(df, file)
+  print(tab)
+  knitr::kable(df, digits = 3, row.names = FALSE, caption = caption)
+}
+
+save_plot <- function(p, name, width = 8, height = 5, dpi = 300) {
+  png_path <- file.path(FIGDIR, paste0(name, ".png"))
+  pdf_path <- file.path(FIGDIR, paste0(name, ".pdf"))
+  ggplot2::ggsave(png_path, p, width = width, height = height, dpi = dpi, bg = "white")
+  ggplot2::ggsave(pdf_path, p, width = width, height = height, bg = "white")
+  cat("Wrote ", png_path, "\n", sep = "")
+  p
+}
+
+audit_contrasts <- list(
+  evidence_placement = "contr.sum",
+  topic_drift = "contr.sum",
+  evidence_density = "contr.sum",
+  agent = "contr.sum",
+  persona = "contr.sum",
+  evidence_in_domain = "contr.sum"
+)
+
+fit_audit <- function(dat) {
+  glmer(
+    retrieved_strict ~ evidence_placement + topic_drift + evidence_density +
+      actual_turns + agent + persona + evidence_in_domain +
+      (1 | question) + (1 | evidence_id),
+    data = dat, family = binomial("logit"),
+    contrasts = audit_contrasts, control = glmer_ctrl
+  )
+}
+```
+
+# Data
+
+```{r load-data}
+raw <- read_csv(AUDIT_CSV, show_col_types = FALSE)
+
+n_incomplete_rows <- sum(raw$all_required_present %in% FALSE, na.rm = TRUE)
+n_incomplete_sess <- raw %>%
+  filter(all_required_present %in% FALSE) %>%
+  distinct(session_id) %>%
+  nrow()
+cat(sprintf("Audit rows: %d | unique sessions: %d\n",
+            nrow(raw), n_distinct(raw$session_id)))
+cat(sprintf("Incomplete (audited missing key information): %d rows / %d sessions\n",
+            n_incomplete_rows, n_incomplete_sess))
+
+dat_all <- raw %>%
+  filter(!is.na(actual_turns),
+         !is.na(evidence_placement),
+         !is.na(topic_drift),
+         !is.na(evidence_density),
+         !is.na(evidence_id),
+         !is.na(evidence_in_domain)) %>%
+  prepare_audit()
+
+dat_complete <- dat_all %>%
+  filter(is.na(all_required_present) | all_required_present)
+
+cat(sprintf("Model sample (all): %d rows\n", nrow(dat_all)))
+cat(sprintf("Model sample (complete only): %d rows\n", nrow(dat_complete)))
+print(table(dat_all$evidence_in_domain, useNA = "ifany"))
+```
+
+```{r describe-incomplete}
+raw %>%
+  filter(all_required_present %in% FALSE) %>%
+  distinct(session_id, evidence_id, persona, evidence_placement,
+           topic_drift, evidence_density) %>%
+  kable(caption = "Incomplete gold sessions (all_required_present = FALSE).")
+```
+
+# Primary audit model (all sessions)
+
+```{r fit-all}
+m_all <- fit_audit(dat_all)
+print(summary(m_all), correlation = FALSE)
+anova_type3(
+  m_all,
+  "audit_anova_full.csv",
+  "Type III Wald tests for the full audit sample (additive model)."
+)
+```
+
+```{r emmeans-all}
+emm_drift <- emmeans(m_all, ~ topic_drift, type = "response")
+emm_drift_agent <- emmeans(m_all, ~ topic_drift | agent, type = "response")
+emm_persona <- emmeans(m_all, ~ persona, type = "response")
+emm_domain <- emmeans(m_all, ~ evidence_in_domain, type = "response")
+save_csv(summary(emm_drift), "audit_emmeans_drift.csv")
+save_csv(summary(emm_drift_agent), "audit_emmeans_drift_by_agent.csv")
+save_csv(summary(emm_persona), "audit_emmeans_persona.csv")
+save_csv(summary(emm_domain), "audit_emmeans_in_domain.csv")
+print(summary(emm_drift))
+print(summary(emm_persona))
+print(summary(emm_domain))
+
+fe_all <- tidy_fixef(m_all) %>%
+  filter(term == "actual_turns")
+kable(fe_all, digits = 3, caption = "Slope of actual_turns (full audit sample).")
+```
+
+```{r plot-drift-agent, fig.width=9, fig.height=6, fig.cap="Topic-drift effect on P(strict hit), one panel per agent."}
+p_drift <- as.data.frame(summary(emm_drift_agent)) %>%
+  mutate(agent = relabel(agent, AGENT_LABELS)) %>%
+  ggplot(aes(topic_drift, prob, colour = agent, group = 1)) +
+  geom_line(linewidth = .7, alpha = .45) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = .55) +
+  facet_wrap(~ agent, ncol = 2) +
+  scale_colour_discrete(guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Topic drift", y = "P(strict hit)") +
+  theme_thesis()
+save_plot(p_drift, "fig_audit_drift_by_agent", width = 9, height = 6)
+```
+
+```{r plot-persona, fig.cap="Estimated P(strict hit) by eval persona."}
+p_persona <- as.data.frame(summary(emm_persona)) %>%
+  mutate(persona = relabel(persona, PERSONA_LABELS)) %>%
+  ggplot(aes(persona, prob, fill = persona)) +
+  geom_col(width = .6) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = .15) +
+  scale_fill_discrete(guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Persona", y = "P(strict hit)") +
+  theme_thesis()
+save_plot(p_persona, "fig_audit_persona", width = 6, height = 4)
+```
+
+```{r plot-in-domain, fig.cap="Estimated P(strict hit) by whether this gold session is in-domain for the eval persona."}
+p_domain <- as.data.frame(summary(emm_domain)) %>%
+  mutate(evidence_in_domain = dplyr::recode(
+    evidence_in_domain,
+    in_domain = "In-domain",
+    out_of_domain = "Out-of-domain"
+  )) %>%
+  ggplot(aes(evidence_in_domain, prob, fill = evidence_in_domain)) +
+  geom_col(width = .6) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = .15) +
+  scale_fill_discrete(guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Gold session vs. eval persona", y = "P(strict hit)") +
+  theme_thesis()
+save_plot(p_domain, "fig_audit_in_domain", width = 5.5, height = 4)
+```
+
+# Sensitivity: drop incomplete sessions
+
+```{r fit-complete}
+m_comp <- fit_audit(dat_complete)
+anova_type3(
+  m_comp,
+  "audit_anova_complete.csv",
+  "Type III Wald tests after dropping incomplete sessions."
+)
+```
+
+```{r compare-coefs}
+focal_pattern <- paste0(
+  "^(evidence_placement|topic_drift|evidence_density|actual_turns)"
+)
+cmp <- full_join(
+  tidy_fixef(m_all) %>%
+    filter(grepl(focal_pattern, term)) %>%
+    select(term, beta_all = estimate, se_all = std.error),
+  tidy_fixef(m_comp) %>%
+    filter(grepl(focal_pattern, term)) %>%
+    select(term, beta_complete = estimate, se_complete = std.error),
+  by = "term"
+) %>%
+  mutate(delta = beta_complete - beta_all)
+save_csv(cmp, "audit_diversity_full_vs_complete.csv")
+kable(cmp, digits = 3,
+      caption = "Generation-attribute coefficients: all sessions vs. incomplete dropped.")
+```
+
+```{r session-info}
+sessionInfo()
+```

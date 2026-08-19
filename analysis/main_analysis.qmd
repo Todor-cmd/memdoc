@@ -1,0 +1,520 @@
+---
+title: "Main analysis: evidence distribution and answer correctness"
+subtitle: "Logistic GLMM following Methodology §4.4"
+author: "Todor Mladenovic"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    embed-resources: true
+    theme: flatly
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 120
+)
+options(width = 110)
+```
+
+Primary confirmatory model on the full answerable sample:
+
+$$\text{correct} \sim \text{persona} + \text{dist} \times \text{agent} + \text{dist} \times \text{topic\_match} + \text{question\_type} + \text{hop\_count} + (1 \mid \text{question})$$
+
+Terms are tested with Type III Wald tests (`car::Anova`), which pair with sum coding: each term is tested given all other terms in the model, including interactions. Effects are then reported as estimated marginal means on the probability scale (including faceted slices). For RQ1c, strict recall is added; a nested LRT asks whether fit improves, and distribution EMMs are compared before vs after. A short robustness check then recomputes raw accuracy after dropping failed generations.
+
+# Setup
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(lme4)
+  library(emmeans)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(broom.mixed)
+  library(car)
+  library(DHARMa)
+  library(knitr)
+})
+
+set.seed(42)
+emm_options(pbkrtest.limit = 1e5, lmerTest.limit = 1e5)
+glmer_ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 3e5))
+
+AGENT_LABELS <- c(
+  agent_1 = "Separate Store",
+  agent_2 = "MemPalace",
+  agent_3 = "Corrective",
+  agent_4 = "Unified Store"
+)
+PERSONA_LABELS <- c(
+  persona_1 = "Tech",
+  persona_2 = "Business-Technology",
+  persona_3 = "Sports"
+)
+DIST_LABELS <- c(
+  document_only = "Document-only",
+  integrated    = "Integrated",
+  memory_only   = "Memory-only"
+)
+TOPIC_LABELS <- c(
+  in_domain      = "In-domain",
+  partial        = "Partial",
+  out_of_domain  = "Out-of-domain"
+)
+QT_LABELS <- c(
+  comparison_query = "Comparison",
+  temporal_query   = "Temporal",
+  inference_query  = "Inference"
+)
+
+AGENT_PAL <- c(
+  "Separate Store" = "#4C72B0",
+  "MemPalace"      = "#DD8452",
+  "Corrective"     = "#55A868",
+  "Unified Store"  = "#C44E52"
+)
+DIST_PAL <- c(
+  "Document-only" = "#8DA0CB",
+  "Integrated"    = "#66C2A5",
+  "Memory-only"   = "#FC8D62"
+)
+TOPIC_PAL <- c(
+  "In-domain"     = "#55A868",
+  "Partial"       = "#DD8452",
+  "Out-of-domain" = "#B0B0B0"
+)
+PERSONA_PAL <- c(
+  "Tech"                 = "#4C72B0",
+  "Business-Technology"  = "#DD8452",
+  "Sports"               = "#55A868"
+)
+
+theme_thesis <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title    = element_blank(),
+      plot.subtitle = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold")
+    )
+}
+
+relabel <- function(x, map) factor(unname(map[as.character(x)]), levels = unname(map))
+```
+
+```{r paths}
+find_repo_root <- function() {
+  candidates <- c(".", "..", getwd())
+  for (cand in candidates) {
+    if (file.exists(file.path(cand, "data", "analysis", "model_features_full.csv"))) {
+      return(normalizePath(cand))
+    }
+  }
+  normalizePath(".")
+}
+REPO   <- find_repo_root()
+DATA   <- file.path(REPO, "data", "analysis")
+OUTDIR <- file.path(DATA, "rmd")
+FIGDIR <- file.path(REPO, "analysis", "figures", "main")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGDIR, recursive = TRUE, showWarnings = FALSE)
+cat("Figure artifacts → ", FIGDIR, "\n", sep = "")
+
+FULL_CSV <- file.path(DATA, "model_features_full.csv")
+stopifnot(file.exists(FULL_CSV))
+```
+
+```{r helpers}
+prepare_factors <- function(dat) {
+  dat$question           <- factor(dat$block_id)
+  dat$persona            <- factor(dat$persona)
+  dat$dist               <- factor(dat$dist)
+  dat$agent              <- factor(dat$agent)
+  dat$question_type      <- factor(dat$question_type)
+  dat$topic_match  <- factor(
+    dat$topical_relevance,
+    levels = c("in_domain", "partial", "out_of_domain")
+  )
+  dat$hop_count          <- as.numeric(dat$hop_count)
+  if ("recall_full_context_strict" %in% names(dat)) {
+    dat$recall_strict <- as.numeric(dat$recall_full_context_strict)
+  }
+  if (any(is.na(dat$hop_count))) {
+    med <- median(dat$hop_count, na.rm = TRUE)
+    message(sprintf("Imputing %d NA hop_count with median (%.0f)",
+                    sum(is.na(dat$hop_count)), med))
+    dat$hop_count[is.na(dat$hop_count)] <- med
+  }
+  dat
+}
+
+tidy_fixef <- function(fit) {
+  broom.mixed::tidy(fit, effects = "fixed", conf.int = TRUE)
+}
+
+save_csv <- function(x, name) {
+  readr::write_csv(as.data.frame(x), file.path(OUTDIR, name))
+  invisible(x)
+}
+
+anova_type3 <- function(fit, file, caption) {
+  tab <- car::Anova(fit, type = 3)
+  tab <- tab[rownames(tab) != "(Intercept)", , drop = FALSE]
+  df <- as.data.frame(tab)
+  df$Term <- gsub("topical_relevance", "topic_match", rownames(df), fixed = TRUE)
+  df <- df[, c("Term", setdiff(names(df), "Term"))]
+  save_csv(df, file)
+  print(tab)
+  knitr::kable(df, digits = 3, row.names = FALSE, caption = caption)
+}
+
+save_plot <- function(p, name, width = 8, height = 5, dpi = 300) {
+  png_path <- file.path(FIGDIR, paste0(name, ".png"))
+  pdf_path <- file.path(FIGDIR, paste0(name, ".pdf"))
+  ggplot2::ggsave(png_path, p, width = width, height = height, dpi = dpi, bg = "white")
+  ggplot2::ggsave(pdf_path, p, width = width, height = height, bg = "white")
+  cat("Wrote ", png_path, "\n", sep = "")
+  p
+}
+
+```
+
+# Data
+
+```{r load-data}
+dat_raw <- read_csv(FULL_CSV, show_col_types = FALSE)
+dat <- dat_raw %>%
+  filter(question_type != "null_query") %>%
+  mutate(recall_strict = recall_full_context_strict) %>%
+  filter(!is.na(recall_strict)) %>%
+  prepare_factors()
+
+cat(sprintf("Confirmatory sample: %d rows | %d questions\n",
+            nrow(dat), dplyr::n_distinct(dat$block_id)))
+print(table(dat$topic_match))
+```
+
+```{r describe}
+dat %>%
+  mutate(
+    Dist  = relabel(dist, DIST_LABELS),
+    Topic = relabel(topic_match, TOPIC_LABELS)
+  ) %>%
+  group_by(Dist, Topic) %>%
+  summarise(n = n(), accuracy = mean(correct), .groups = "drop") %>%
+  kable(digits = 3, caption = "Raw Exact-Match accuracy by distribution and topic match.")
+```
+
+```{r plot-raw-dist-agent, fig.width=9, fig.height=6, fig.cap="Raw (unmodelled) Exact-Match accuracy by evidence distribution, one panel per agent. Lines are personas."}
+wilson <- function(k, n) {
+  z <- 1.96; p <- k / n
+  ctr <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  hw  <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  data.frame(lo = pmax(0, ctr - hw), hi = pmin(1, ctr + hw))
+}
+
+raw_grid_ci <- dat %>%
+  group_by(dist, agent, persona) %>%
+  summarise(k = sum(correct), n = n(), acc = mean(correct), .groups = "drop") %>%
+  bind_cols(., wilson(.$k, .$n)) %>%
+  mutate(dist    = relabel(dist, DIST_LABELS),
+         agent   = relabel(agent, AGENT_LABELS),
+         persona = relabel(persona, PERSONA_LABELS))
+
+p_raw_lines <- raw_grid_ci %>%
+  ggplot(aes(dist, acc, colour = persona, group = persona)) +
+  geom_line(linewidth = .8) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), linewidth = .55) +
+  facet_wrap(~ agent, ncol = 2) +
+  scale_colour_manual(values = PERSONA_PAL, name = NULL) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Evidence distribution", y = "Accuracy") +
+  theme_thesis() +
+  theme(panel.grid.major.x = element_line(colour = "grey92"))
+save_plot(p_raw_lines, "fig_main_raw_dist_by_agent", width = 9, height = 6)
+```
+
+# Primary model
+
+```{r primary}
+contr_primary <- list(
+  persona = "contr.sum",
+  dist = "contr.sum",
+  agent = "contr.sum",
+  topic_match = "contr.sum",
+  question_type = "contr.sum"
+)
+
+m_primary <- glmer(
+  correct ~ persona + dist * agent + dist * topic_match +
+            question_type + hop_count + (1 | question),
+  data = dat, family = binomial("logit"),
+  contrasts = contr_primary, control = glmer_ctrl
+)
+cat("Primary formula:\n  ", deparse(formula(m_primary), width.cutoff = 200), "\n")
+print(summary(m_primary), correlation = FALSE)
+```
+
+```{r anova-primary}
+anova_type3(
+  m_primary,
+  "main_anova_primary.csv",
+  "Type III Wald tests for the primary model."
+)
+```
+
+# Estimated marginal means
+
+```{r emmeans}
+emm_dist <- emmeans(m_primary, ~ dist, type = "response")
+save_csv(summary(emm_dist), "main_emmeans_dist.csv")
+save_csv(as.data.frame(pairs(emm_dist, adjust = "holm")), "main_contrasts_dist.csv")
+print(summary(emm_dist))
+print(pairs(emm_dist, adjust = "holm"))
+
+emm_da <- emmeans(m_primary, ~ dist | agent, type = "response")
+save_csv(summary(emm_da), "main_emmeans_dist_by_agent.csv")
+save_csv(as.data.frame(pairs(emm_da, adjust = "holm")),
+         "main_contrasts_dist_by_agent.csv")
+
+emm_dt <- emmeans(m_primary, ~ dist | topic_match, type = "response")
+save_csv(summary(emm_dt), "main_emmeans_dist_by_topic.csv")
+save_csv(as.data.frame(pairs(emm_dt, adjust = "holm")),
+         "main_contrasts_dist_by_topic.csv")
+print(summary(emm_dt))
+
+emm_dq <- emmeans(m_primary, ~ dist | question_type, type = "response")
+save_csv(summary(emm_dq), "main_emmeans_dist_by_qtype.csv")
+save_csv(as.data.frame(pairs(emm_dq, adjust = "holm")),
+         "main_contrasts_dist_by_qtype.csv")
+print(summary(emm_dq))
+```
+
+```{r plot-dist, fig.cap="Estimated P(correct) by evidence distribution."}
+p_dist <- as.data.frame(summary(emm_dist)) %>%
+  mutate(dist = relabel(dist, DIST_LABELS)) %>%
+  ggplot(aes(dist, prob, fill = dist)) +
+  geom_col(width = .6) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = .15) +
+  geom_text(aes(label = scales::percent(prob, accuracy = 0.1)),
+            vjust = -0.6, size = 3.4) +
+  scale_fill_manual(values = DIST_PAL, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Evidence distribution", y = "P(correct)") +
+  theme_thesis()
+save_plot(p_dist, "fig_main_dist", width = 6, height = 4.5)
+```
+
+```{r plot-dist-agent, fig.width=9, fig.height=6, fig.cap="Distribution effect by agent."}
+p_da <- as.data.frame(summary(emm_da)) %>%
+  mutate(dist  = relabel(dist, DIST_LABELS),
+         agent = relabel(agent, AGENT_LABELS)) %>%
+  ggplot(aes(dist, prob, colour = agent, group = 1)) +
+  geom_line(linewidth = .7, alpha = .45) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = .55) +
+  facet_wrap(~ agent, ncol = 2) +
+  scale_colour_manual(values = AGENT_PAL, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Evidence distribution", y = "P(correct)") +
+  theme_thesis()
+save_plot(p_da, "fig_main_dist_by_agent", width = 9, height = 6)
+```
+
+```{r plot-dist-topic, fig.width=9, fig.height=4.5, fig.cap="Distribution effect by topic match."}
+p_dt <- as.data.frame(summary(emm_dt)) %>%
+  mutate(dist  = relabel(dist, DIST_LABELS),
+         topic = relabel(topic_match, TOPIC_LABELS)) %>%
+  ggplot(aes(dist, prob, colour = topic, group = 1)) +
+  geom_line(linewidth = .7, alpha = .45) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = .55) +
+  facet_wrap(~ topic, ncol = 3) +
+  scale_colour_manual(values = TOPIC_PAL, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Evidence distribution", y = "P(correct)") +
+  theme_thesis()
+save_plot(p_dt, "fig_main_dist_by_topic", width = 9, height = 4.5)
+```
+
+```{r plot-dist-qtype, fig.width=9, fig.height=4.5, fig.cap="Distribution effect by question type."}
+p_dq <- as.data.frame(summary(emm_dq)) %>%
+  mutate(dist = relabel(dist, DIST_LABELS),
+         qtype = relabel(question_type, QT_LABELS)) %>%
+  ggplot(aes(dist, prob, colour = qtype, group = 1)) +
+  geom_line(linewidth = .7, alpha = .45) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = .55) +
+  facet_wrap(~ qtype, ncol = 3) +
+  scale_colour_discrete(guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Evidence distribution", y = "P(correct)") +
+  theme_thesis()
+save_plot(p_dq, "fig_main_dist_by_qtype", width = 9, height = 4.5)
+```
+
+# RQ1c: add recall
+
+```{r recall}
+m_recall <- update(m_primary, . ~ . + recall_strict)
+print(anova(m_primary, m_recall))
+anova_type3(
+  m_recall,
+  "main_anova_recall.csv",
+  "Type III Wald tests after adding strict recall (residual check, not a re-test of the experimental factors)."
+)
+
+emm_dt_r <- emmeans(m_recall, ~ dist | topic_match, type = "response")
+save_csv(summary(emm_dt_r), "main_emmeans_dist_by_topic_with_recall.csv")
+print(summary(emm_dt_r))
+
+dat %>%
+  group_by(topic_match, dist) %>%
+  summarise(n = n(),
+            recall = mean(recall_strict),
+            accuracy = mean(correct),
+            .groups = "drop") %>%
+  kable(digits = 3,
+        caption = "Raw mean strict recall and Exact-Match by distribution and topic match.")
+
+emm_dist_r <- emmeans(m_recall, ~ dist, type = "response")
+save_csv(summary(emm_dist_r), "main_emmeans_dist_with_recall.csv")
+
+dist_before <- as.data.frame(summary(emm_dist)) %>%
+  select(dist, prob_primary = prob)
+dist_after <- as.data.frame(summary(emm_dist_r)) %>%
+  select(dist, prob_with_recall = prob)
+dist_shrink <- inner_join(dist_before, dist_after, by = "dist") %>%
+  mutate(delta = prob_with_recall - prob_primary)
+save_csv(dist_shrink, "main_dist_emm_before_after_recall.csv")
+kable(dist_shrink, digits = 3,
+      caption = "Distribution EMMs (P(correct)) before vs. after controlling for strict recall.")
+
+pair_prob_diffs <- function(emm_sum) {
+  lv <- as.character(emm_sum$dist)
+  p <- emm_sum$prob
+  names(p) <- lv
+  combos <- utils::combn(lv, 2)
+  tibble::tibble(
+    contrast = paste(combos[1, ], "-", combos[2, ]),
+    diff = unname(p[combos[1, ]] - p[combos[2, ]])
+  )
+}
+pairs_before <- pair_prob_diffs(dist_before %>% rename(prob = prob_primary))
+pairs_after  <- pair_prob_diffs(dist_after %>% rename(prob = prob_with_recall))
+contrast_shrink <- inner_join(
+  pairs_before %>% rename(diff_primary = diff),
+  pairs_after %>% rename(diff_with_recall = diff),
+  by = "contrast"
+) %>%
+  mutate(delta = diff_with_recall - diff_primary)
+save_csv(contrast_shrink, "main_dist_contrasts_before_after_recall.csv")
+kable(contrast_shrink, digits = 3,
+      caption = "Pairwise distribution gaps on the probability scale, before vs. after recall.")
+```
+
+```{r plot-recall-shrink, fig.cap="Distribution EMMs with and without recall in the model."}
+p_shrink <- dist_shrink %>%
+  mutate(dist = relabel(dist, DIST_LABELS)) %>%
+  pivot_longer(c(prob_primary, prob_with_recall),
+               names_to = "model", values_to = "prob") %>%
+  mutate(model = dplyr::recode(model,
+                        prob_primary = "Primary",
+                        prob_with_recall = "+ recall")) %>%
+  ggplot(aes(dist, prob, fill = model)) +
+  geom_col(position = position_dodge(width = .7), width = .65) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Evidence distribution", y = "P(correct)", fill = NULL) +
+  theme_thesis()
+save_plot(p_shrink, "fig_main_dist_recall_shrink", width = 7, height = 4.5)
+```
+
+# Sensitivity: drop failed generations
+
+Failed inferences are scored as incorrect in the primary fit. Refit the same GLMM after dropping those rows and compare Type III Wald tests to the primary table.
+
+```{r sensitivity-failed}
+runs <- read_csv(
+  file.path(REPO, "data", "experiment_runs", "labeled_runs.csv"),
+  show_col_types = FALSE
+)
+dat_s <- dat %>%
+  left_join(
+    runs %>%
+      filter(grepl("\\[INFERENCE_FAILED\\]", as.character(prediction), perl = TRUE)) %>%
+      distinct(block_id, persona, dist, agent) %>%
+      mutate(inference_failed = TRUE),
+    by = c("block_id", "persona", "dist", "agent")
+  ) %>%
+  mutate(inference_failed = tidyr::replace_na(inference_failed, FALSE))
+
+n_fail <- sum(dat_s$inference_failed)
+cat(sprintf("Failed generations: %d / %d (%.1f%%)\n",
+            n_fail, nrow(dat_s), 100 * n_fail / nrow(dat_s)))
+
+dat_nofail <- dat_s %>% filter(!inference_failed)
+m_nofail <- update(m_primary, data = dat_nofail)
+anova_type3(
+  m_nofail,
+  "main_anova_drop_failures.csv",
+  "Type III Wald tests after dropping failed generations."
+)
+
+anova_cmp <- function(fit) {
+  tab <- as.data.frame(car::Anova(fit, type = 3))
+  tab$Term <- rownames(tab)
+  tab
+}
+cmp <- full_join(
+  anova_cmp(m_primary) %>%
+    select(Term, Chisq_all = Chisq, p_all = `Pr(>Chisq)`),
+  anova_cmp(m_nofail) %>%
+    select(Term, Chisq_nofail = Chisq, p_nofail = `Pr(>Chisq)`),
+  by = "Term"
+) %>%
+  mutate(
+    delta_Chisq = Chisq_nofail - Chisq_all,
+    delta_p = p_nofail - p_all
+  )
+save_csv(cmp, "main_anova_primary_vs_drop_failures.csv")
+kable(cmp, digits = 3,
+      caption = "Type III tests: primary sample vs. failed generations dropped.")
+```
+
+# Diagnostics
+
+```{r dharma, fig.width=10, fig.height=5}
+run_dharma <- function(fit, label) {
+  sim <- simulateResiduals(fit, n = 1000, plot = FALSE)
+  plot(sim, main = label)
+  ks   <- testUniformity(sim, plot = FALSE)
+  disp <- testDispersion(sim, plot = FALSE)
+  zi   <- testZeroInflation(sim, plot = FALSE)
+  data.frame(model = label,
+             uniformity_p = ks$p.value,
+             dispersion_p = disp$p.value,
+             zero_inflation_p = zi$p.value)
+}
+
+diag <- bind_rows(
+  run_dharma(m_primary, "Primary"),
+  run_dharma(m_recall, "Primary + recall")
+)
+save_csv(diag, "main_dharma_diagnostics.csv")
+kable(diag, digits = 4, caption = "DHARMa simulated-residual diagnostics.")
+```
+
+```{r session-info}
+sessionInfo()
+```
