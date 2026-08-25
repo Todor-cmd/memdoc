@@ -271,12 +271,12 @@ The experiment set has 210 questions. Confirmatory analysis drops the 12 `null_q
 Label raw runs (EM correctness and in-domain flags), then export model-feature tables:
 
 ```bash
-python3 analysis/collect_evaluation_metadata.py \
+python analysis/collect_evaluation_metadata.py \
   --runs-dir data/experiment_runs \
   --questions-pkl data/questions/experiment_210_split.pkl \
   --output data/experiment_runs/labeled_runs.csv
 
-python3 analysis/prepare_model_features.py
+python analysis/prepare_model_features.py
 ```
 
 Render the Quarto analyses:
