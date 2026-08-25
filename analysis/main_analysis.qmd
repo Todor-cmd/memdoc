@@ -27,7 +27,7 @@ Primary confirmatory model on the full answerable sample:
 
 $$\text{correct} \sim \text{persona} + \text{dist} \times \text{agent} + \text{dist} \times \text{topic\_match} + \text{question\_type} + \text{hop\_count} + (1 \mid \text{question})$$
 
-Terms are tested with Type III Wald tests (`car::Anova`), which pair with sum coding: each term is tested given all other terms in the model, including interactions. Effects are then reported as estimated marginal means on the probability scale (including faceted slices). For RQ1c, strict recall is added; a nested LRT asks whether fit improves, and distribution EMMs are compared before vs after. A short robustness check then recomputes raw accuracy after dropping failed generations.
+Terms are tested with Type III Wald tests (`car::Anova`), which pair with sum coding: each term is tested given all other terms in the model, including interactions. Effects are then reported as estimated marginal means on the probability scale (including the agent main effect and faceted slices). For RQ1c, strict recall is added; a nested LRT asks whether fit improves, and distribution EMMs are compared before vs after. A short robustness check then recomputes raw accuracy after dropping failed generations.
 
 # Setup
 
@@ -284,6 +284,13 @@ save_csv(as.data.frame(pairs(emm_dist, adjust = "holm")), "main_contrasts_dist.c
 print(summary(emm_dist))
 print(pairs(emm_dist, adjust = "holm"))
 
+emm_agent <- emmeans(m_primary, ~ agent, type = "response")
+save_csv(summary(emm_agent), "main_emmeans_agent.csv")
+save_csv(as.data.frame(pairs(emm_agent, adjust = "holm")),
+         "main_contrasts_agent.csv")
+print(summary(emm_agent))
+print(pairs(emm_agent, adjust = "holm"))
+
 emm_da <- emmeans(m_primary, ~ dist | agent, type = "response")
 save_csv(summary(emm_da), "main_emmeans_dist_by_agent.csv")
 save_csv(as.data.frame(pairs(emm_da, adjust = "holm")),
@@ -316,6 +323,22 @@ p_dist <- as.data.frame(summary(emm_dist)) %>%
   labs(x = "Evidence distribution", y = "P(correct)") +
   theme_thesis()
 save_plot(p_dist, "fig_main_dist", width = 6, height = 4.5)
+```
+
+```{r plot-agent, fig.cap="Estimated P(correct) by agent, averaged over evidence distribution."}
+p_agent <- as.data.frame(summary(emm_agent)) %>%
+  mutate(agent = relabel(agent, AGENT_LABELS)) %>%
+  ggplot(aes(agent, prob, fill = agent)) +
+  geom_col(width = .6) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = .15) +
+  geom_text(aes(label = scales::percent(prob, accuracy = 0.1)),
+            vjust = -0.6, size = 3.4) +
+  scale_fill_manual(values = AGENT_PAL, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Agent", y = "P(correct)") +
+  theme_thesis()
+save_plot(p_agent, "fig_main_agent", width = 6, height = 4.5)
 ```
 
 ```{r plot-dist-agent, fig.width=9, fig.height=6, fig.cap="Distribution effect by agent."}

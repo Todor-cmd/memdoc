@@ -167,3 +167,6 @@ data/*
 !data/experiment_design.csv
 !data/experiment_design_power.csv
 .vscode/
+.quarto/
+analysis/notebooks/
+analysis/figures/
